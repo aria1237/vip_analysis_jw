@@ -1,0 +1,1237 @@
+---
+title: "MH_predictable_jw"
+author: "jingyao"
+date: "2025-11-07"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  results = 'hide'  # Hide intermediate output by default
+)
+
+# Load required packages
+library(haven)      # for reading Stata .dta files
+library(dplyr)      # for data manipulation
+library(ggplot2)    # for visualization
+library(fixest)     # for fixed effects and clustered SE
+library(modelsummary) # for regression tables
+library(kableExtra) # for nice tables
+library(stringr)    # for string manipulation
+library(purrr)      # for map functions
+library(broom)      # for tidy model output
+library(tidyr)      # for pivot functions
+```
+
+## Import Data
+```{r import-data}
+# Import Stata data file
+# Note: Use forward slashes or double backslashes in file paths
+data_path <- "C:/Users/jingy/Dropbox/VIP/09. Main study/09. Data/20. Generated/simon_analysis/30_merged-hh_id-period.dta"
+
+# Check if file exists
+if (!file.exists(data_path)) {
+  stop("Error: Data file not found at: ", data_path)
+}
+
+cat("Loading data from:", data_path, "\n")
+data <- read_dta(data_path)
+cat("Data loaded successfully!\n")
+cat("Dimensions:", nrow(data), "rows x", ncol(data), "columns\n\n")
+
+# Display data structure
+str(data)
+
+# Display first few rows
+head(data)
+
+# Summary statistics
+summary(data)
+```
+
+## Check Variable Names
+```{r check-variables}
+# Display all variable names
+cat("Variable names in the dataset:\n")
+names(data)
+
+# Check if 'predictable' variable exists
+if ("predictable" %in% names(data)) {
+  cat("\n'predictable' variable found!\n")
+  cat("Values of predictable:\n")
+  table(data$predictable, useNA = "ifany")
+} else {
+  cat("\nWarning: 'predictable' variable not found in dataset\n")
+}
+```
+
+## Configuration: Outcomes and Controls
+```{r config}
+# Outcome variables to analyze
+outcome_vars <- c(
+  "phq2_z",
+  "gad2_z",
+  "days_worked",
+  "food_purchase_total_99",
+  "food_consumption_total_99",
+  "current_savings_99",
+  "loan_total_outstanding_99"
+)
+
+# Control variables (continuous covariates)
+control_vars <- c()  # Empty for now, add as needed
+
+# Baseline mental health controls (will be included in model but hidden from tables)
+baseline_controls <- c("phq2_z_baseline", "gad2_z_baseline")
+
+# Fixed effects (will be absorbed, not shown in output)
+fixed_effects <- c("period", "district_id", "wave", "enum_id", "day_of_week", "cohort")
+```
+
+## Create Baseline Variables
+```{r create-baseline}
+# Extract baseline (period 0) values for mental health outcomes
+baseline_data <- data %>%
+  filter(predictable == 1, period == 0) %>%
+  select(hh_id, phq2_z, gad2_z) %>%
+  rename(phq2_z_baseline = phq2_z,
+         gad2_z_baseline = gad2_z)
+
+cat("Baseline data created:\n")
+cat("  Households with baseline:", nrow(baseline_data), "\n")
+cat("  Missing phq2_z_baseline:", sum(is.na(baseline_data$phq2_z_baseline)), "\n")
+cat("  Missing gad2_z_baseline:", sum(is.na(baseline_data$gad2_z_baseline)), "\n")
+```
+
+## Filter Data for Predictable == 1
+```{r filter-data}
+# Filter to keep only predictable == 1, exclude baseline (period 0)
+data_filtered <- data %>%
+  filter(predictable == 1, period > 0) %>%
+  # Merge with baseline controls
+  left_join(baseline_data, by = "hh_id")
+
+# Display filtered data dimensions
+cat("Original dataset:\n")
+cat("  Observations:", nrow(data), "\n")
+cat("  Variables:", ncol(data), "\n\n")
+
+cat("Filtered dataset (predictable == 1, period > 0):\n")
+cat("  Observations:", nrow(data_filtered), "\n")
+cat("  Variables:", ncol(data_filtered), "\n")
+cat("  Unique households:", length(unique(data_filtered$hh_id)), "\n")
+cat("  Periods included:", sort(unique(data_filtered$period)), "\n")
+
+# Check baseline controls
+cat("\nBaseline controls availability:\n")
+cat("  phq2_z_baseline missing:", sum(is.na(data_filtered$phq2_z_baseline)), "/", nrow(data_filtered), "\n")
+cat("  gad2_z_baseline missing:", sum(is.na(data_filtered$gad2_z_baseline)), "/", nrow(data_filtered), "\n")
+
+# Display first few rows of filtered data
+head(data_filtered %>% select(hh_id, period, phq2_z, gad2_z, phq2_z_baseline, gad2_z_baseline))
+```
+
+## Create Analytical Variables
+```{r create-variables}
+# Function to calculate pattern characteristics
+calc_pattern_chars <- function(schedule_str) {
+  # Calculate characteristics for a full 6-period schedule
+  draws <- strsplit(schedule_str, "")[[1]]
+
+  # Max consecutive H's
+  h_runs <- rle(draws == "H")
+  max_consec_h <- ifelse(any(h_runs$values), max(h_runs$lengths[h_runs$values]), 0)
+
+  # Max consecutive L's
+  max_consec_l <- ifelse(any(!h_runs$values), max(h_runs$lengths[!h_runs$values]), 0)
+
+  # Number of switches
+  num_switches <- sum(draws[-1] != draws[-length(draws)])
+
+  # Temporal concentration
+  h_first_half <- sum(draws[1:3] == "H")
+  h_second_half <- sum(draws[4:6] == "H")
+
+  return(data.frame(
+    max_consec_h = max_consec_h,
+    max_consec_l = max_consec_l,
+    num_switches = num_switches,
+    h_first_half = h_first_half,
+    h_second_half = h_second_half
+  ))
+}
+
+# Function to calculate history and future measures for each period
+calc_period_measures <- function(df) {
+  df %>%
+    group_by(hh_id) %>%
+    arrange(period) %>%
+    mutate(
+      # Current draw as binary
+      current_draw = ifelse(draw == "H", 1, 0),
+
+      # History measures (cumulative up to current period)
+      num_h_past = cumsum(current_draw),
+      num_l_past = cumsum(1 - current_draw),
+
+      # Calculate pattern so far
+      pattern_so_far = sapply(1:n(), function(i) {
+        if (i == 1) return(draw[1])
+        paste(draw[1:i], collapse = "")
+      }),
+
+      # Future measures (from next period onwards)
+      num_h_future = 3 - num_h_past,
+      num_l_future = 3 - num_l_past,
+
+      # Periods since/until H
+      periods_since_last_h = sapply(1:n(), function(i) {
+        h_positions <- which(draw[1:i] == "H")
+        if (length(h_positions) == 0) return(NA)
+        i - max(h_positions)
+      }),
+
+      periods_until_next_h = sapply(1:n(), function(i) {
+        if (i == n()) return(NA)
+        h_positions <- which(draw[(i+1):n()] == "H")
+        if (length(h_positions) == 0) return(NA)
+        min(h_positions)
+      })
+    ) %>%
+    ungroup()
+}
+
+# Function to calculate clustering measures for history and future
+calc_clustering_measures <- function(df) {
+  df %>%
+    group_by(hh_id) %>%
+    arrange(period) %>%
+    mutate(
+      # Past clustering
+      max_consec_h_past = sapply(1:n(), function(i) {
+        past_draws <- draw[1:i]
+        h_runs <- rle(past_draws == "H")
+        if (any(h_runs$values)) max(h_runs$lengths[h_runs$values]) else 0
+      }),
+
+      switches_past = sapply(1:n(), function(i) {
+        if (i == 1) return(0)
+        past_draws <- draw[1:i]
+        sum(past_draws[-1] != past_draws[-length(past_draws)])
+      }),
+
+      # Future clustering
+      max_consec_h_future = sapply(1:n(), function(i) {
+        if (i == n()) return(NA)
+        future_draws <- draw[(i+1):n()]
+        h_runs <- rle(future_draws == "H")
+        if (any(h_runs$values)) max(h_runs$lengths[h_runs$values]) else 0
+      }),
+
+      switches_future = sapply(1:n(), function(i) {
+        if (i == n()) return(NA)
+        future_draws <- draw[(i+1):n()]
+        if (length(future_draws) <= 1) return(0)
+        sum(future_draws[-1] != future_draws[-length(future_draws)])
+      })
+    ) %>%
+    ungroup()
+}
+
+# Apply transformations
+cat("Creating analytical variables...\n")
+
+# Add full schedule pattern characteristics
+schedule_chars <- unique(data_filtered$schedule) %>%
+  sapply(calc_pattern_chars, simplify = FALSE) %>%
+  bind_rows() %>%
+  mutate(schedule = unique(data_filtered$schedule))
+
+data_analysis <- data_filtered %>%
+  left_join(schedule_chars, by = "schedule") %>%
+  calc_period_measures() %>%
+  calc_clustering_measures() %>%
+  mutate(
+    # Set reference category for schedule
+    schedule_fct = relevel(factor(schedule), ref = "HLHLHL")
+  )
+
+cat("Variables created successfully!\n")
+cat("Sample of new variables:\n")
+print(data_analysis %>%
+  select(hh_id, period, schedule, draw, current_draw,
+         num_h_past, num_h_future, switches_past, switches_future) %>%
+  head(20))
+```
+
+## Descriptive Statistics
+```{r descriptive-stats}
+# Pattern characteristics summary
+cat("Schedule Pattern Characteristics:\n")
+schedule_chars %>%
+  arrange(schedule) %>%
+  print()
+
+cat("\n\nDistribution of pattern characteristics:\n")
+summary(schedule_chars %>% select(-schedule))
+
+# Sample distribution by period
+cat("\n\nObservations by period:\n")
+table(data_analysis$period)
+```
+
+# STRATEGY 1: Panel Analysis by Schedule Pattern
+
+## Strategy 1A: Categorical Schedule Approach
+```{r strategy1-categorical}
+# Build control string (continuous covariates + baseline MH)
+all_controls <- c(control_vars, baseline_controls)
+control_str <- ifelse(length(all_controls) > 0,
+                     paste(" +", paste(all_controls, collapse = " + ")),
+                     "")
+
+# Build fixed effects string (categorical variables to absorb)
+fe_str <- paste(fixed_effects, collapse = " + ")
+
+# Panel regression: Outcome ~ schedule + controls | fixed effects
+# Tests whether different income schedules affect mental health across all periods
+
+cat("Panel sample size:", nrow(data_analysis), "\n")
+cat("Unique schedules:", length(unique(data_analysis$schedule)), "\n")
+
+# Run regressions for each outcome
+results_s1_categorical <- list()
+
+for (outcome in outcome_vars) {
+  # Check if outcome has variation
+  if (sd(data_analysis[[outcome]], na.rm = TRUE) == 0) {
+    cat("Skipping", outcome, "- no variation\n")
+    next
+  }
+
+  formula_str <- paste0(
+    outcome, " ~ schedule_fct",
+    control_str,
+    " | ", fe_str
+  )
+
+  model <- feols(
+    as.formula(formula_str),
+    data = data_analysis,
+    cluster = ~hh_id
+  )
+
+  results_s1_categorical[[outcome]] <- model
+
+  cat("\n=== Strategy 1A: Categorical Schedules (Panel) ===\n")
+  cat("Outcome:", outcome, "\n")
+  print(summary(model))
+}
+```
+
+## Strategy 1B-i: Max Consecutive High Draws (Main Effect)
+```{r strategy1b-max-consec-h}
+# Test clustering of high draws - main effect
+results_s1b_max_consec_h <- list()
+
+for (outcome in outcome_vars) {
+  if (sd(data_analysis[[outcome]], na.rm = TRUE) == 0) {
+    cat("Skipping", outcome, "- no variation\n")
+    next
+  }
+
+  formula_str <- paste0(
+    outcome, " ~ max_consec_h",
+    control_str,
+    " | ", fe_str
+  )
+
+  model <- feols(
+    as.formula(formula_str),
+    data = data_analysis,
+    cluster = ~hh_id
+  )
+
+  results_s1b_max_consec_h[[outcome]] <- model
+
+  cat("\n=== Strategy 1B-i: Max Consecutive H (Main Effect) ===\n")
+  cat("Outcome:", outcome, "\n")
+  print(summary(model))
+}
+```
+
+## Strategy 1B-ii: Max Consecutive High Draws × Period
+```{r strategy1b-interaction}
+# Test whether max_consec_h effects vary over time
+results_s1b_interaction <- list()
+
+# Build fixed effects without period (since we interact with it)
+fe_str_no_period <- paste(setdiff(fixed_effects, "period"), collapse = " + ")
+
+for (outcome in outcome_vars) {
+  if (sd(data_analysis[[outcome]], na.rm = TRUE) == 0) {
+    cat("Skipping", outcome, "- no variation\n")
+    next
+  }
+
+  formula_str <- paste0(
+    outcome, " ~ max_consec_h * factor(period)",
+    control_str,
+    " | ", fe_str_no_period
+  )
+
+  model <- feols(
+    as.formula(formula_str),
+    data = data_analysis,
+    cluster = ~hh_id
+  )
+
+  results_s1b_interaction[[outcome]] <- model
+
+  cat("\n=== Strategy 1B-ii: Max Consecutive H × Period ===\n")
+  cat("Outcome:", outcome, "\n")
+  print(summary(model))
+}
+```
+
+## Strategy 1C-i: Max Consecutive Low Draws (Main Effect)
+```{r strategy1c-max-consec-l}
+# Test clustering of low draws - main effect
+results_s1c_max_consec_l <- list()
+
+for (outcome in outcome_vars) {
+  if (sd(data_analysis[[outcome]], na.rm = TRUE) == 0) {
+    cat("Skipping", outcome, "- no variation\n")
+    next
+  }
+
+  formula_str <- paste0(
+    outcome, " ~ max_consec_l",
+    control_str,
+    " | ", fe_str
+  )
+
+  model <- feols(
+    as.formula(formula_str),
+    data = data_analysis,
+    cluster = ~hh_id
+  )
+
+  results_s1c_max_consec_l[[outcome]] <- model
+
+  cat("\n=== Strategy 1C-i: Max Consecutive L (Main Effect) ===\n")
+  cat("Outcome:", outcome, "\n")
+  print(summary(model))
+}
+```
+
+## Strategy 1C-ii: Max Consecutive Low Draws × Period
+```{r strategy1c-interaction}
+# Test whether max_consec_l effects vary over time
+results_s1c_interaction <- list()
+
+for (outcome in outcome_vars) {
+  if (sd(data_analysis[[outcome]], na.rm = TRUE) == 0) {
+    cat("Skipping", outcome, "- no variation\n")
+    next
+  }
+
+  formula_str <- paste0(
+    outcome, " ~ max_consec_l * factor(period)",
+    control_str,
+    " | ", fe_str_no_period
+  )
+
+  model <- feols(
+    as.formula(formula_str),
+    data = data_analysis,
+    cluster = ~hh_id
+  )
+
+  results_s1c_interaction[[outcome]] <- model
+
+  cat("\n=== Strategy 1C-ii: Max Consecutive L × Period ===\n")
+  cat("Outcome:", outcome, "\n")
+  print(summary(model))
+}
+```
+
+## Strategy 1D-i: Number of Switches (Main Effect)
+```{r strategy1d-num-switches}
+# Test volatility effects - main effect
+results_s1d_num_switches <- list()
+
+for (outcome in outcome_vars) {
+  if (sd(data_analysis[[outcome]], na.rm = TRUE) == 0) {
+    cat("Skipping", outcome, "- no variation\n")
+    next
+  }
+
+  formula_str <- paste0(
+    outcome, " ~ num_switches",
+    control_str,
+    " | ", fe_str
+  )
+
+  model <- feols(
+    as.formula(formula_str),
+    data = data_analysis,
+    cluster = ~hh_id
+  )
+
+  results_s1d_num_switches[[outcome]] <- model
+
+  cat("\n=== Strategy 1D-i: Number of Switches (Main Effect) ===\n")
+  cat("Outcome:", outcome, "\n")
+  print(summary(model))
+}
+```
+
+## Strategy 1D-ii: Number of Switches × Period
+```{r strategy1d-interaction}
+# Test whether volatility effects vary over time
+results_s1d_interaction <- list()
+
+for (outcome in outcome_vars) {
+  if (sd(data_analysis[[outcome]], na.rm = TRUE) == 0) {
+    cat("Skipping", outcome, "- no variation\n")
+    next
+  }
+
+  formula_str <- paste0(
+    outcome, " ~ num_switches * factor(period)",
+    control_str,
+    " | ", fe_str_no_period
+  )
+
+  model <- feols(
+    as.formula(formula_str),
+    data = data_analysis,
+    cluster = ~hh_id
+  )
+
+  results_s1d_interaction[[outcome]] <- model
+
+  cat("\n=== Strategy 1D-ii: Number of Switches × Period ===\n")
+  cat("Outcome:", outcome, "\n")
+  print(summary(model))
+}
+```
+
+## Strategy 1E-i: Temporal Concentration (Main Effect)
+```{r strategy1e-h-first-half}
+# Test temporal concentration - main effect
+results_s1e_h_first_half <- list()
+
+for (outcome in outcome_vars) {
+  if (sd(data_analysis[[outcome]], na.rm = TRUE) == 0) {
+    cat("Skipping", outcome, "- no variation\n")
+    next
+  }
+
+  formula_str <- paste0(
+    outcome, " ~ h_first_half",
+    control_str,
+    " | ", fe_str
+  )
+
+  model <- feols(
+    as.formula(formula_str),
+    data = data_analysis,
+    cluster = ~hh_id
+  )
+
+  results_s1e_h_first_half[[outcome]] <- model
+
+  cat("\n=== Strategy 1E-i: H in First Half (Main Effect) ===\n")
+  cat("Outcome:", outcome, "\n")
+  print(summary(model))
+}
+```
+
+## Strategy 1E-ii: Temporal Concentration × Period
+```{r strategy1e-interaction}
+# Test whether temporal concentration effects vary over time
+results_s1e_interaction <- list()
+
+for (outcome in outcome_vars) {
+  if (sd(data_analysis[[outcome]], na.rm = TRUE) == 0) {
+    cat("Skipping", outcome, "- no variation\n")
+    next
+  }
+
+  formula_str <- paste0(
+    outcome, " ~ h_first_half * factor(period)",
+    control_str,
+    " | ", fe_str_no_period
+  )
+
+  model <- feols(
+    as.formula(formula_str),
+    data = data_analysis,
+    cluster = ~hh_id
+  )
+
+  results_s1e_interaction[[outcome]] <- model
+
+  cat("\n=== Strategy 1E-ii: H in First Half × Period ===\n")
+  cat("Outcome:", outcome, "\n")
+  print(summary(model))
+}
+```
+
+## Strategy 1: Results Tables
+```{r strategy1-tables, results='asis'}
+# Strategy 1A: Categorical Schedules
+if (length(results_s1_categorical) > 0) {
+  cat("\n=== Strategy 1A Results: Categorical Schedules ===\n")
+  modelsummary(
+    results_s1_categorical,
+    stars = TRUE,
+    coef_omit = "baseline",
+    gof_map = c("nobs", "r.squared", "adj.r.squared"),
+    title = "Strategy 1A: Panel Analysis - Categorical Schedules (Ref: HLHLHL, Clustered SE by HH)",
+    notes = c("Controls included but not shown: phq2_z_baseline, gad2_z_baseline",
+              "Fixed effects (absorbed): period, district_id, wave, enum_id, day_of_week, cohort",
+              "Standard errors clustered by household ID")
+  )
+}
+
+# Strategy 1B-i: Max Consecutive High Draws (Main Effect)
+if (length(results_s1b_max_consec_h) > 0) {
+  cat("\n=== Strategy 1B-i Results: Max Consecutive High Draws (Main Effect) ===\n")
+  modelsummary(
+    results_s1b_max_consec_h,
+    stars = TRUE,
+    coef_omit = "baseline",
+    gof_map = c("nobs", "r.squared", "adj.r.squared"),
+    title = "Strategy 1B-i: Panel Analysis - Max Consecutive High Draws (Clustered SE by HH)",
+    notes = c("Controls included but not shown: phq2_z_baseline, gad2_z_baseline",
+              "Fixed effects (absorbed): period, district_id, wave, enum_id, day_of_week, cohort",
+              "Standard errors clustered by household ID")
+  )
+}
+
+# Strategy 1B-ii: Max Consecutive High Draws × Period
+if (length(results_s1b_interaction) > 0) {
+  cat("\n=== Strategy 1B-ii Results: Max Consecutive High Draws × Period ===\n")
+  modelsummary(
+    results_s1b_interaction,
+    stars = TRUE,
+    coef_omit = "baseline",
+    gof_map = c("nobs", "r.squared", "adj.r.squared"),
+    title = "Strategy 1B-ii: Panel Analysis - Max Consecutive High × Period (Clustered SE by HH)",
+    notes = c("Controls included but not shown: phq2_z_baseline, gad2_z_baseline",
+              "Fixed effects (absorbed): district_id, wave, enum_id, day_of_week, cohort",
+              "Period not absorbed (used in interaction)",
+              "Standard errors clustered by household ID")
+  )
+}
+
+# Strategy 1C-i: Max Consecutive Low Draws (Main Effect)
+if (length(results_s1c_max_consec_l) > 0) {
+  cat("\n=== Strategy 1C-i Results: Max Consecutive Low Draws (Main Effect) ===\n")
+  modelsummary(
+    results_s1c_max_consec_l,
+    stars = TRUE,
+    coef_omit = "baseline",
+    gof_map = c("nobs", "r.squared", "adj.r.squared"),
+    title = "Strategy 1C-i: Panel Analysis - Max Consecutive Low Draws (Clustered SE by HH)",
+    notes = c("Controls included but not shown: phq2_z_baseline, gad2_z_baseline",
+              "Fixed effects (absorbed): period, district_id, wave, enum_id, day_of_week, cohort",
+              "Standard errors clustered by household ID")
+  )
+}
+
+# Strategy 1C-ii: Max Consecutive Low Draws × Period
+if (length(results_s1c_interaction) > 0) {
+  cat("\n=== Strategy 1C-ii Results: Max Consecutive Low Draws × Period ===\n")
+  modelsummary(
+    results_s1c_interaction,
+    stars = TRUE,
+    coef_omit = "baseline",
+    gof_map = c("nobs", "r.squared", "adj.r.squared"),
+    title = "Strategy 1C-ii: Panel Analysis - Max Consecutive Low × Period (Clustered SE by HH)",
+    notes = c("Controls included but not shown: phq2_z_baseline, gad2_z_baseline",
+              "Fixed effects (absorbed): district_id, wave, enum_id, day_of_week, cohort",
+              "Period not absorbed (used in interaction)",
+              "Standard errors clustered by household ID")
+  )
+}
+
+# Strategy 1D-i: Number of Switches (Main Effect)
+if (length(results_s1d_num_switches) > 0) {
+  cat("\n=== Strategy 1D-i Results: Number of Switches (Main Effect) ===\n")
+  modelsummary(
+    results_s1d_num_switches,
+    stars = TRUE,
+    coef_omit = "baseline",
+    gof_map = c("nobs", "r.squared", "adj.r.squared"),
+    title = "Strategy 1D-i: Panel Analysis - Number of Switches (Clustered SE by HH)",
+    notes = c("Controls included but not shown: phq2_z_baseline, gad2_z_baseline",
+              "Fixed effects (absorbed): period, district_id, wave, enum_id, day_of_week, cohort",
+              "Standard errors clustered by household ID")
+  )
+}
+
+# Strategy 1D-ii: Number of Switches × Period
+if (length(results_s1d_interaction) > 0) {
+  cat("\n=== Strategy 1D-ii Results: Number of Switches × Period ===\n")
+  modelsummary(
+    results_s1d_interaction,
+    stars = TRUE,
+    coef_omit = "baseline",
+    gof_map = c("nobs", "r.squared", "adj.r.squared"),
+    title = "Strategy 1D-ii: Panel Analysis - Number of Switches × Period (Clustered SE by HH)",
+    notes = c("Controls included but not shown: phq2_z_baseline, gad2_z_baseline",
+              "Fixed effects (absorbed): district_id, wave, enum_id, day_of_week, cohort",
+              "Period not absorbed (used in interaction)",
+              "Standard errors clustered by household ID")
+  )
+}
+
+# Strategy 1E-i: Temporal Concentration (Main Effect)
+if (length(results_s1e_h_first_half) > 0) {
+  cat("\n=== Strategy 1E-i Results: Temporal Concentration (Main Effect) ===\n")
+  modelsummary(
+    results_s1e_h_first_half,
+    stars = TRUE,
+    coef_omit = "baseline",
+    gof_map = c("nobs", "r.squared", "adj.r.squared"),
+    title = "Strategy 1E-i: Panel Analysis - Temporal Concentration (Clustered SE by HH)",
+    notes = c("Controls included but not shown: phq2_z_baseline, gad2_z_baseline",
+              "Fixed effects (absorbed): period, district_id, wave, enum_id, day_of_week, cohort",
+              "Standard errors clustered by household ID")
+  )
+}
+
+# Strategy 1E-ii: Temporal Concentration × Period
+if (length(results_s1e_interaction) > 0) {
+  cat("\n=== Strategy 1E-ii Results: Temporal Concentration × Period ===\n")
+  modelsummary(
+    results_s1e_interaction,
+    stars = TRUE,
+    coef_omit = "baseline",
+    gof_map = c("nobs", "r.squared", "adj.r.squared"),
+    title = "Strategy 1E-ii: Panel Analysis - H in First Half × Period (Clustered SE by HH)",
+    notes = c("Controls included but not shown: phq2_z_baseline, gad2_z_baseline",
+              "Fixed effects (absorbed): district_id, wave, enum_id, day_of_week, cohort",
+              "Period not absorbed (used in interaction)",
+              "Standard errors clustered by household ID")
+  )
+}
+```
+
+# VISUALIZATION: Mental Health Trajectories by Schedule
+
+## Prepare Data for Visualization
+```{r viz-prep-data}
+# Calculate mean outcomes and standard errors for each schedule in each period
+viz_data <- data_analysis %>%
+  group_by(schedule, period) %>%
+  summarise(
+    mean_phq2 = mean(phq2_z, na.rm = TRUE),
+    se_phq2 = sd(phq2_z, na.rm = TRUE) / sqrt(sum(!is.na(phq2_z))),
+    mean_gad2 = mean(gad2_z, na.rm = TRUE),
+    se_gad2 = sd(gad2_z, na.rm = TRUE) / sqrt(sum(!is.na(gad2_z))),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  left_join(schedule_chars, by = "schedule")
+
+# Order schedules by volatility for consistent ordering
+schedule_order <- schedule_chars %>%
+  arrange(num_switches, desc(max_consec_h)) %>%
+  pull(schedule)
+
+viz_data <- viz_data %>%
+  mutate(schedule = factor(schedule, levels = schedule_order))
+
+cat("Visualization data prepared:\n")
+cat("  Schedules:", length(unique(viz_data$schedule)), "\n")
+cat("  Periods:", length(unique(viz_data$period)), "\n")
+```
+
+## Depression (phq2_z) Trajectories - All 20 Schedules
+```{r viz-depression-all, fig.width=20, fig.height=16, results='show'}
+# Create plot with all 20 schedules for depression
+ggplot(viz_data, aes(x = period, y = mean_phq2)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", alpha = 0.5) +
+  geom_line(color = "#E41A1C", linewidth = 1) +
+  geom_point(color = "#E41A1C", size = 2.5) +
+  geom_ribbon(aes(ymin = mean_phq2 - 1.96*se_phq2,
+                  ymax = mean_phq2 + 1.96*se_phq2),
+              fill = "#E41A1C", alpha = 0.15) +
+  facet_wrap(~schedule, ncol = 5, scales = "free_y") +
+  scale_x_continuous(breaks = 1:6) +
+  labs(
+    title = "Depression Trajectories by Income Schedule",
+    subtitle = "Mean depression scores (phq2_z) across 6 periods for each of 20 income schedules. Shaded areas show 95% CI.",
+    x = "Period",
+    y = "Mean Depression Score (Standardized)",
+    caption = "Schedules ordered by volatility: Top rows = low volatility (clustered), Bottom rows = high volatility (alternating)"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold", size = 10),
+    plot.title = element_text(face = "bold", size = 16),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(size = 9)
+  )
+```
+
+## Anxiety (gad2_z) Trajectories - All 20 Schedules
+```{r viz-anxiety-all, fig.width=20, fig.height=16, results='show'}
+# Create plot with all 20 schedules for anxiety
+ggplot(viz_data, aes(x = period, y = mean_gad2)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", alpha = 0.5) +
+  geom_line(color = "#377EB8", linewidth = 1) +
+  geom_point(color = "#377EB8", size = 2.5) +
+  geom_ribbon(aes(ymin = mean_gad2 - 1.96*se_gad2,
+                  ymax = mean_gad2 + 1.96*se_gad2),
+              fill = "#377EB8", alpha = 0.15) +
+  facet_wrap(~schedule, ncol = 5, scales = "free_y") +
+  scale_x_continuous(breaks = 1:6) +
+  labs(
+    title = "Anxiety Trajectories by Income Schedule",
+    subtitle = "Mean anxiety scores (gad2_z) across 6 periods for each of 20 income schedules. Shaded areas show 95% CI.",
+    x = "Period",
+    y = "Mean Anxiety Score (Standardized)",
+    caption = "Schedules ordered by volatility: Top rows = low volatility (clustered), Bottom rows = high volatility (alternating)"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold", size = 10),
+    plot.title = element_text(face = "bold", size = 16),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(size = 9)
+  )
+```
+
+# STRATEGY 4: Timing Effects Analysis
+
+## Strategy 4: Create Period-Specific Draw Variables
+
+```{r strategy4-create-vars}
+# Create dummy variables for whether each period had an H draw
+# Since participants know their full schedule, all 6 draws are "known" even in early periods
+
+data_timing <- data_analysis %>%
+  group_by(hh_id) %>%
+  arrange(period) %>%
+  mutate(
+    # Extract what draw occurred in each of the 6 periods
+    draw_p1 = ifelse(nth(draw, 1) == "H", 1, 0),
+    draw_p2 = ifelse(nth(draw, 2) == "H", 1, 0),
+    draw_p3 = ifelse(nth(draw, 3) == "H", 1, 0),
+    draw_p4 = ifelse(nth(draw, 4) == "H", 1, 0),
+    draw_p5 = ifelse(nth(draw, 5) == "H", 1, 0),
+    draw_p6 = ifelse(nth(draw, 6) == "H", 1, 0)
+  ) %>%
+  ungroup()
+
+# Verify the constraint: sum should equal 3 for everyone
+cat("Verifying 3H + 3L constraint:\n")
+data_timing %>%
+  group_by(hh_id) %>%
+  slice(1) %>%
+  mutate(sum_h = draw_p1 + draw_p2 + draw_p3 + draw_p4 + draw_p5 + draw_p6) %>%
+  pull(sum_h) %>%
+  table() %>%
+  print()
+
+cat("\nSample of timing variables:\n")
+data_timing %>%
+  select(hh_id, period, schedule, draw_p1, draw_p2, draw_p3, draw_p4, draw_p5, draw_p6) %>%
+  head(12) %>%
+  print()
+```
+
+## Strategy 4: Timing Effects - When High Draws Occur
+
+```{r strategy4-timing}
+# Build control string
+all_controls <- c(control_vars, baseline_controls)
+control_str <- ifelse(length(all_controls) > 0,
+                     paste(" +", paste(all_controls, collapse = " + ")),
+                     "")
+
+# Build fixed effects string
+fe_str <- paste(fixed_effects, collapse = " + ")
+
+# Panel regression: Test whether WHEN you get high draws matters
+# Reference category: draw_p1 (omitted due to collinearity)
+# Interpretation: β_k = effect of H in period k vs H in period 1
+
+results_s4_timing <- list()
+
+for (outcome in outcome_vars) {
+  if (sd(data_timing[[outcome]], na.rm = TRUE) == 0) {
+    cat("Skipping", outcome, "- no variation\n")
+    next
+  }
+
+  # Omit draw_p1 as reference
+  formula_str <- paste0(
+    outcome, " ~ draw_p2 + draw_p3 + draw_p4 + draw_p5 + draw_p6",
+    control_str,
+    " | ", fe_str
+  )
+
+  model <- feols(
+    as.formula(formula_str),
+    data = data_timing,
+    cluster = ~hh_id
+  )
+
+  results_s4_timing[[outcome]] <- model
+
+  cat("\n=== Strategy 4: Timing Effects ===\n")
+  cat("Outcome:", outcome, "\n")
+  cat("Reference: H in Period 1\n")
+  print(summary(model))
+}
+```
+
+## Strategy 4: Results Tables
+
+```{r strategy4-tables, results='asis'}
+# Strategy 4: Timing Effects
+if (length(results_s4_timing) > 0) {
+  cat("\n=== Strategy 4 Results: Timing Effects ===\n")
+  modelsummary(
+    results_s4_timing,
+    stars = TRUE,
+    coef_omit = "baseline",
+    gof_map = c("nobs", "r.squared", "adj.r.squared"),
+    title = "Strategy 4: Timing Effects (Reference: H in Period 1, Clustered SE by HH)",
+    notes = c("Controls included but not shown: phq2_z_baseline, gad2_z_baseline",
+              "Fixed effects (absorbed): period, district_id, wave, enum_id, day_of_week, cohort",
+              "Standard errors clustered by household ID")
+  )
+}
+```
+
+
+# STRATEGY 5: Early Income Concentration Effects
+
+## Strategy 5: Create Grouping Variables
+
+```{r strategy5-create-groups}
+# Create grouping variables based on early income concentration
+# Using household-level schedule information
+
+data_grouped <- data_analysis %>%
+  group_by(hh_id) %>%
+  arrange(period) %>%
+  mutate(
+    # Count H's in first 3 periods (t=1,2,3)
+    h_in_early = sum(c(nth(draw, 1), nth(draw, 2), nth(draw, 3)) == "H", na.rm = TRUE),
+
+    # Strategy 5A: Binary early concentration (50-50 split)
+    early_group = ifelse(h_in_early >= 2,
+                         "Early High (2-3H in t=1-3)",
+                         "Early Low (0-1H in t=1-3)")
+  ) %>%
+  ungroup()
+
+# Summary statistics
+cat("\n=== STRATEGY 5 GROUPING SUMMARY ===\n\n")
+
+cat("Strategy 5A: Binary Early Concentration\n")
+data_grouped %>%
+  group_by(hh_id) %>%
+  slice(1) %>%
+  ungroup() %>%
+  count(early_group) %>%
+  print()
+
+# Descriptive statistics by group
+cat("\n=== Mean Outcomes by Early Group ===\n")
+data_grouped %>%
+  group_by(early_group) %>%
+  summarise(
+    n_obs = n(),
+    n_hh = n_distinct(hh_id),
+    mean_phq2 = mean(phq2_z, na.rm = TRUE),
+    mean_gad2 = mean(gad2_z, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  print()
+```
+
+## Strategy 5A: Binary Early Concentration (Primary Analysis)
+
+```{r strategy5a-main}
+# Build control string (continuous covariates + baseline MH)
+all_controls <- c(control_vars, baseline_controls)
+control_str <- ifelse(length(all_controls) > 0,
+                     paste(" +", paste(all_controls, collapse = " + ")),
+                     "")
+
+# Build fixed effects string (categorical variables to absorb)
+fe_str <- paste(fixed_effects, collapse = " + ")
+
+# Panel regression: Outcome ~ early_group + controls | fixed effects
+# Tests whether early income concentration affects mental health
+# REFERENCE: Early Low (0-1H in t=1-3)
+
+# Set reference category for early_group
+data_grouped <- data_grouped %>%
+  mutate(early_group_fct = relevel(factor(early_group), ref = "Early Low (0-1H in t=1-3)"))
+
+results_s5a <- list()
+
+for (outcome in outcome_vars) {
+  if (sd(data_grouped[[outcome]], na.rm = TRUE) == 0) {
+    cat("Skipping", outcome, "- no variation\n")
+    next
+  }
+
+  # REGRESSION 1: Main effect of early concentration
+  # Reference category: Early Low (0-1H in t=1-3)
+  formula_str <- paste0(
+    outcome, " ~ early_group_fct",
+    control_str,
+    " | ", fe_str
+  )
+
+  model <- feols(
+    as.formula(formula_str),
+    data = data_grouped,
+    cluster = ~hh_id
+  )
+
+  results_s5a[[outcome]] <- model
+
+  cat("\n=== Strategy 5A Regression 1: Early Concentration (Main Effect) ===\n")
+  cat("Outcome:", outcome, "\n")
+  cat("Reference: Early Low (0-1H in t=1-3)\n")
+  print(summary(model))
+}
+```
+
+## Strategy 5A: Interaction with Period
+
+```{r strategy5a-interaction}
+# Test whether early concentration effects vary over time
+# Interaction: early_group × period
+# REFERENCE: Early Low (0-1H in t=1-3)
+
+# Fixed effects excluding period (since period is interacted with treatment)
+fe_str_no_period <- paste(setdiff(fixed_effects, "period"), collapse = " + ")
+
+results_s5a_interaction <- list()
+
+for (outcome in outcome_vars) {
+  if (sd(data_grouped[[outcome]], na.rm = TRUE) == 0) {
+    cat("Skipping", outcome, "- no variation\n")
+    next
+  }
+
+  # REGRESSION 2: Early concentration × period interaction
+  # Reference category: Early Low (0-1H in t=1-3)
+  # Note: Cannot absorb period FE when interacting with period
+  formula_str <- paste0(
+    outcome, " ~ early_group_fct * factor(period)",
+    control_str,
+    " | ", fe_str_no_period
+  )
+
+  model <- feols(
+    as.formula(formula_str),
+    data = data_grouped,
+    cluster = ~hh_id
+  )
+
+  results_s5a_interaction[[outcome]] <- model
+
+  cat("\n=== Strategy 5A Regression 2: Early Concentration × Period ===\n")
+  cat("Outcome:", outcome, "\n")
+  cat("Reference: Early Low (0-1H in t=1-3)\n")
+  print(summary(model))
+}
+```
+
+## Strategy 5A: Analysis Excluding Period 6 (Periods 1-5 Only)
+
+```{r strategy5a-period15}
+# Build control and fixed effects strings
+all_controls <- c(control_vars, baseline_controls)
+control_str <- ifelse(length(all_controls) > 0,
+                     paste(" +", paste(all_controls, collapse = " + ")),
+                     "")
+
+fe_str <- paste(fixed_effects, collapse = " + ")
+fe_str_no_period <- paste(setdiff(fixed_effects, "period"), collapse = " + ")
+
+# Filter data to periods 1-5 only
+data_grouped_p15 <- data_grouped %>%
+  filter(period <= 5)
+
+cat("\n=== Filtering to Periods 1-5 ===\n")
+cat("Original observations:", nrow(data_grouped), "\n")
+cat("Filtered observations:", nrow(data_grouped_p15), "\n")
+cat("Periods included:", sort(unique(data_grouped_p15$period)), "\n\n")
+
+# REGRESSION 1: Main effect (Periods 1-5)
+results_s5a_p15 <- list()
+
+for (outcome in outcome_vars) {
+  if (sd(data_grouped_p15[[outcome]], na.rm = TRUE) == 0) {
+    cat("Skipping", outcome, "- no variation\n")
+    next
+  }
+
+  formula_str <- paste0(
+    outcome, " ~ early_group_fct",
+    control_str,
+    " | ", fe_str
+  )
+
+  model <- feols(
+    as.formula(formula_str),
+    data = data_grouped_p15,
+    cluster = ~hh_id
+  )
+
+  results_s5a_p15[[outcome]] <- model
+
+  cat("\n=== Strategy 5A (Periods 1-5): Main Effect ===\n")
+  cat("Outcome:", outcome, "\n")
+  cat("Reference: Early Low (0-1H in t=1-3)\n")
+  print(summary(model))
+}
+
+# REGRESSION 2: Interaction with period (Periods 1-5)
+results_s5a_interaction_p15 <- list()
+
+for (outcome in outcome_vars) {
+  if (sd(data_grouped_p15[[outcome]], na.rm = TRUE) == 0) {
+    cat("Skipping", outcome, "- no variation\n")
+    next
+  }
+
+  formula_str <- paste0(
+    outcome, " ~ early_group_fct * factor(period)",
+    control_str,
+    " | ", fe_str_no_period
+  )
+
+  model <- feols(
+    as.formula(formula_str),
+    data = data_grouped_p15,
+    cluster = ~hh_id
+  )
+
+  results_s5a_interaction_p15[[outcome]] <- model
+
+  cat("\n=== Strategy 5A (Periods 1-5): Interaction ===\n")
+  cat("Outcome:", outcome, "\n")
+  cat("Reference: Early Low (0-1H in t=1-3)\n")
+  print(summary(model))
+}
+```
+
+## Strategy 5: Results Tables
+
+```{r strategy5-tables, results='asis'}
+# Tables for Strategy 5A: All Periods (1-6) and Periods 1-5 Only
+
+# ========== ALL PERIODS (1-6) ==========
+
+# Strategy 5A Regression 1: Main Effects Only (All Periods)
+if (length(results_s5a) > 0) {
+  cat("\n=== Strategy 5A Regression 1: Main Effect (All Periods 1-6) ===\n")
+  modelsummary(
+    results_s5a,
+    stars = TRUE,
+    coef_omit = "baseline",
+    gof_map = c("nobs", "r.squared", "adj.r.squared"),
+    title = "Strategy 5A Regression 1 (All Periods 1-6): Main Effect (Reference: Early Low, Clustered SE by HH)",
+    notes = c("Controls included but not shown: phq2_z_baseline, gad2_z_baseline",
+              "Fixed effects (absorbed): period, district_id, wave, enum_id, day_of_week, cohort",
+              "Standard errors clustered by household ID")
+  )
+}
+
+# Strategy 5A Regression 2: With Period Interactions (All Periods)
+if (length(results_s5a_interaction) > 0) {
+  cat("\n=== Strategy 5A Regression 2: Interaction (All Periods 1-6) ===\n")
+  modelsummary(
+    results_s5a_interaction,
+    stars = TRUE,
+    coef_omit = "baseline",
+    gof_map = c("nobs", "r.squared", "adj.r.squared"),
+    title = "Strategy 5A Regression 2 (All Periods 1-6): Early High × Period (Reference: Early Low, Clustered SE by HH)",
+    notes = c("Controls included but not shown: phq2_z_baseline, gad2_z_baseline",
+              "Fixed effects (absorbed): district_id, wave, enum_id, day_of_week, cohort",
+              "Period effects are interacted with treatment and shown in coefficients",
+              "Standard errors clustered by household ID")
+  )
+}
+
+# ========== PERIODS 1-5 ONLY ==========
+
+# Strategy 5A Regression 1: Main Effects Only (Periods 1-5)
+if (length(results_s5a_p15) > 0) {
+  cat("\n=== Strategy 5A Regression 1: Main Effect (Periods 1-5 Only) ===\n")
+  modelsummary(
+    results_s5a_p15,
+    stars = TRUE,
+    coef_omit = "baseline",
+    gof_map = c("nobs", "r.squared", "adj.r.squared"),
+    title = "Strategy 5A Regression 1 (Periods 1-5 Only): Main Effect (Reference: Early Low, Clustered SE by HH)",
+    notes = c("Controls included but not shown: phq2_z_baseline, gad2_z_baseline",
+              "Fixed effects (absorbed): period, district_id, wave, enum_id, day_of_week, cohort",
+              "Standard errors clustered by household ID")
+  )
+}
+
+# Strategy 5A Regression 2: With Period Interactions (Periods 1-5)
+if (length(results_s5a_interaction_p15) > 0) {
+  cat("\n=== Strategy 5A Regression 2: Interaction (Periods 1-5 Only) ===\n")
+  modelsummary(
+    results_s5a_interaction_p15,
+    stars = TRUE,
+    coef_omit = "baseline",
+    gof_map = c("nobs", "r.squared", "adj.r.squared"),
+    title = "Strategy 5A Regression 2 (Periods 1-5 Only): Early High × Period (Reference: Early Low, Clustered SE by HH)",
+    notes = c("Controls included but not shown: phq2_z_baseline, gad2_z_baseline",
+              "Fixed effects (absorbed): district_id, wave, enum_id, day_of_week, cohort",
+              "Period effects are interacted with treatment and shown in coefficients",
+              "Standard errors clustered by household ID")
+  )
+}
+
+# ========== COMBINED COMPARISON TABLE ==========
+
+# Combined table comparing All Periods vs Periods 1-5
+if (length(results_s5a) > 0 && length(results_s5a_p15) > 0) {
+  cat("\n=== Strategy 5A: Comparison - All Periods vs Periods 1-5 ===\n")
+
+  # Combine models for side-by-side comparison
+  all_comparison_models <- c(
+    setNames(results_s5a, paste0(names(results_s5a), "_AllPeriods")),
+    setNames(results_s5a_p15, paste0(names(results_s5a_p15), "_P1to5"))
+  )
+
+  modelsummary(
+    all_comparison_models,
+    stars = TRUE,
+    coef_omit = "baseline",
+    gof_map = c("nobs", "r.squared", "adj.r.squared"),
+    title = "Strategy 5A: Main Effect - All Periods (1-6) vs Periods 1-5 (Reference: Early Low, Clustered SE by HH)",
+    notes = c("Controls included but not shown: phq2_z_baseline, gad2_z_baseline",
+              "Fixed effects (absorbed): period, district_id, wave, enum_id, day_of_week, cohort",
+              "Standard errors clustered by household ID")
+  )
+}
+```
